@@ -1,6 +1,5 @@
 import os
 import threading
-import asyncio
 import logging
 import hashlib
 import uuid
@@ -14,18 +13,15 @@ from sqlalchemy.orm import sessionmaker
 import requests
 from dotenv import load_dotenv
 
-# Carrega variáveis de ambiente (no Render, elas serão configuradas no painel)
 load_dotenv()
 
 # --- Configurações ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
 MERCADOPAGO_ACCESS_TOKEN = os.getenv("MERCADOPAGO_ACCESS_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL") # Ex: https://seu-bot.onrender.com/webhook
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 # --- Banco de Dados (SQLite) ---
-# AVISO: No Render, o SQLite é apagado a cada deploy. Para testes rápidos, serve.
-# Se quiser que os dados fiquem salvos, use um banco PostgreSQL externo (ex: Neon, Supabase).
 Base = declarative_base()
 engine = create_engine('sqlite:///database.db', echo=False, connect_args={'check_same_thread': False})
 Session = sessionmaker(bind=engine)
@@ -99,7 +95,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         await query.edit_message_text("⚙️ Painel Administrativo:", reply_markup=InlineKeyboardMarkup(teclado_admin))
     elif data == "admin_voltar" and is_admin(user.id):
-        await start(update, context) # Chama o start novamente para mostrar o menu principal
+        await query.edit_message_text("Use /start para voltar ao menu principal.")
     elif data == "admin_depositar" and is_admin(user.id):
         await query.edit_message_text("Digite o ID do Telegram do usuário:")
         context.user_data['acao'] = 'admin_aguardando_id_deposito'
@@ -228,7 +224,7 @@ def webhook():
             session.close()
     return jsonify({"status": "received"}), 200
 
-# --- Inicialização ---
+# --- Inicialização do Bot ---
 def run_bot():
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
@@ -239,11 +235,10 @@ def run_bot():
     print("Bot rodando...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
+# Inicia o bot automaticamente quando o Gunicorn importar o módulo
+bot_thread = threading.Thread(target=run_bot, daemon=True)
+bot_thread.start()
+
 if __name__ == '__main__':
-    # Inicia o Bot em uma thread separada para não bloquear o Flask
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
-    
-    # Inicia o Flask na porta que o Render exige
     port = int(os.environ.get("PORT", 10000))
     flask_app.run(host='0.0.0.0', port=port)
