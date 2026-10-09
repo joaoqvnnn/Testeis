@@ -225,9 +225,8 @@ def webhook():
             session.close()
     return jsonify({"status": "received"}), 200
 
-# --- Inicialização do Bot ---
+# --- Inicialização do Bot (versão assíncrona sem dependência de main thread) ---
 def run_bot():
-    # Cria um novo event loop para esta thread (obrigatório no Python 3.10+)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -237,8 +236,16 @@ def run_bot():
     application.add_handler(CallbackQueryHandler(pix_tipo_callback, pattern="^pix_"))
     application.add_handler(CallbackQueryHandler(confirmar_saque_callback, pattern="^(confirmar_saque|cancelar_saque)$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Bot rodando...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    async def _start():
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        print("Bot rodando...")
+        stop_event = asyncio.Event()
+        await stop_event.wait()
+
+    loop.run_until_complete(_start())
 
 # Inicia o bot automaticamente quando o Gunicorn importar o módulo
 bot_thread = threading.Thread(target=run_bot, daemon=True)
