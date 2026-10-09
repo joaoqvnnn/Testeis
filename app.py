@@ -1,5 +1,6 @@
 import os
 import threading
+import asyncio
 import logging
 import hashlib
 import uuid
@@ -226,6 +227,10 @@ def webhook():
 
 # --- Inicialização do Bot ---
 def run_bot():
+    # Cria um novo event loop para esta thread (obrigatório no Python 3.10+)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(menu_callback))
