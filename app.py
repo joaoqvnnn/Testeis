@@ -18,7 +18,6 @@ from PIL import Image, ImageDraw, ImageFont
 
 load_dotenv()
 
-# --- Configurações ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
 MERCADOPAGO_ACCESS_TOKEN = os.getenv("MERCADOPAGO_ACCESS_TOKEN")
@@ -27,7 +26,6 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 # --- Banco de Dados ---
 Base = declarative_base()
 engine = create_engine('sqlite:///database.db', echo=False, connect_args={'check_same_thread': False})
-Session = sessionmaker(bind=engine)
 
 class User(Base):
     __tablename__ = 'users'
@@ -52,26 +50,23 @@ class Transaction(Base):
     pix_chave = Column(String(150))
     created_at = Column(DateTime, default=datetime.utcnow)
 
+# Dropa e recria as tabelas toda vez que o serviço inicia (garante estrutura atualizada)
+Base.metadata.drop_all(engine)
 Base.metadata.create_all(engine)
+
+Session = sessionmaker(bind=engine)
 def get_session(): return Session()
 
-# --- Auxiliares ---
 def hash_senha(s): return hashlib.sha256(s.encode()).hexdigest()
 def is_admin(uid): return str(uid) == str(ADMIN_TELEGRAM_ID)
-def mask_cpf(cpf): 
+def mask_cpf(cpf):
     if not cpf or len(cpf) < 11: return "***.***.***-**"
     return f"***.{cpf[3:6]}.{cpf[6:9]}-**"
-def mask_chave(chave):
-    if not chave: return "***"
-    if len(chave) <= 4: return "*" * len(chave)
-    return chave[:3] + "*" * (len(chave) - 5) + chave[-2:]
 
-# --- Gera imagem de comprovante ---
 def gerar_comprovante(nome, cpf, chave, tipo, valor, data, status, ext_ref):
     W, H = 800, 900
     img = Image.new("RGB", (W, H), "white")
     d = ImageDraw.Draw(img)
-
     try:
         font_big = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 32)
         font_med = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
@@ -79,28 +74,24 @@ def gerar_comprovante(nome, cpf, chave, tipo, valor, data, status, ext_ref):
     except:
         font_big = font_med = font = ImageFont.load_default()
 
-    # Cabeçalho
     d.rectangle([0, 0, W, 120], fill="#0d47a1")
-    d.text((30, 40), "COMPROVANTE DE TRANSFERÊNCIA", font=font_big, fill="white")
+    d.text((30, 40), "COMPROVANTE DE TRANSFERENCIA", font=font_big, fill="white")
 
-    # Status verde
     d.rectangle([0, 120, W, 180], fill="#e8f5e9")
-    d.text((30, 135), f"✔ {status}", font=font_med, fill="#2e7d32")
+    d.text((30, 135), f"OK - {status}", font=font_med, fill="#2e7d32")
 
-    # Valor destacado
     d.text((30, 210), "Valor", font=font_med, fill="#666")
     d.text((30, 240), f"R$ {valor:.2f}", font=font_big, fill="#0d47a1")
 
-    # Linhas de dados
     y = 320
     dados = [
         ("Tipo de chave", tipo.upper()),
-        ("Chave PIX", mask_chave(chave)),
+        ("Chave PIX", chave),
         ("Nome do titular", nome),
         ("CPF do titular", mask_cpf(cpf)),
         ("Data", data),
-        ("ID da transação", ext_ref),
-        ("Instituição", "Mercado Pago"),
+        ("ID da transacao", ext_ref),
+        ("Instituicao", "Mercado Pago"),
     ]
     for label, valor_txt in dados:
         d.text((30, y), label, font=font, fill="#888")
@@ -109,7 +100,6 @@ def gerar_comprovante(nome, cpf, chave, tipo, valor, data, status, ext_ref):
         y += 55
 
     d.text((30, H - 60), "Comprovante gerado automaticamente pelo bot.", font=font, fill="#999")
-
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)
@@ -127,7 +117,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_user = User(telegram_id=str(user.id), username=user.username or user.first_name)
         session.add(db_user); session.commit()
     session.close()
-
     teclado = [
         [InlineKeyboardButton("💰 Meu Saldo", callback_data="menu_saldo")],
         [InlineKeyboardButton("💸 Sacar PIX", callback_data="menu_sacar")],
@@ -142,7 +131,6 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     data = query.data; user = query.from_user
     session = get_session(); db_user = session.query(User).filter_by(telegram_id=str(user.id)).first()
-
     if data == "menu_saldo":
         await query.edit_message_text(f"💰 Seu saldo atual é: R$ {db_user.balance:.2f}")
     elif data == "menu_depositar":
@@ -185,7 +173,7 @@ async def pix_tipo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tipo = query.data.split("_")[1]
     context.user_data['pix_tipo'] = tipo
     context.user_data['acao'] = 'aguardando_chave_pix'
-    await query.edit_message_text(f"Você escolheu *{tipo.upper()}*. Agora digite a chave PIX (só números, sem pontos ou traços):", parse_mode='Markdown')
+    await query.edit_message_text(f"Você escolheu *{tipo.upper()}*. Agora digite a chave PIX (só números):", parse_mode='Markdown')
 
 async def confirmar_saque_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
@@ -274,16 +262,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Use /start para ver o menu.")
     session.close()
 
-# ============================================================
-# ================== DEPÓSITO VIA PIX REAL ===================
-# ============================================================
 async def gerar_pix_deposito(update, context, target_user, valor, admin=False):
     ext_ref = f"DEP-{uuid.uuid4().hex[:12]}"
     url = "https://api.mercadopago.com/v1/payments"
     headers = {"Authorization": f"Bearer {MERCADOPAGO_ACCESS_TOKEN}", "Content-Type": "application/json", "X-Idempotency-Key": ext_ref}
     payload = {
         "transaction_amount": float(valor),
-        "description": f"Depósito no bot - User {target_user.telegram_id}",
+        "description": f"Deposito bot - User {target_user.telegram_id}",
         "payment_method_id": "pix",
         "external_reference": ext_ref,
         "notification_url": WEBHOOK_URL,
@@ -310,19 +295,21 @@ async def gerar_pix_deposito(update, context, target_user, valor, admin=False):
         if hasattr(e, "response") and e.response is not None: print("Detalhes:", e.response.text)
         await update.message.reply_text("❌ Erro ao gerar PIX.")
 
-# ============================================================
-# ======================= SAQUE PIX ==========================
-# ============================================================
 async def processar_saque(update, context, db_user, session):
     valor = context.user_data.get('valor_saque'); tipo = context.user_data.get('pix_tipo')
     chave = context.user_data.get('pix_valor'); cpf = context.user_data.get('cpf_titular')
     nome = context.user_data.get('nome_titular')
     ext_ref = f"SAQ-{uuid.uuid4().hex[:12]}"
 
-    tx = Transaction(user_id=db_user.id, type='withdraw', amount=valor, status='pending',
-                     external_reference=ext_ref, nome_titular=nome, cpf_titular=cpf,
-                     pix_tipo=tipo, pix_chave=chave)
-    session.add(tx); session.commit()
+    try:
+        tx = Transaction(user_id=db_user.id, type='withdraw', amount=valor, status='pending',
+                         external_reference=ext_ref, nome_titular=nome, cpf_titular=cpf,
+                         pix_tipo=tipo, pix_chave=chave)
+        session.add(tx); session.commit()
+    except Exception as e:
+        print(f"Erro ao salvar tx: {e}")
+        await update.message.reply_text(f"❌ Erro interno ao salvar: `{str(e)[:300]}`", parse_mode='Markdown')
+        session.close(); return
 
     url = "https://api.mercadopago.com/v1/transaction-intents/process"
     headers = {"Authorization": f"Bearer {MERCADOPAGO_ACCESS_TOKEN}", "Content-Type": "application/json", "X-Idempotency-Key": ext_ref}
@@ -339,7 +326,6 @@ async def processar_saque(update, context, db_user, session):
         response = requests.post(url, headers=headers, json=payload, timeout=30)
         response.raise_for_status()
         await update.message.reply_text("⏳ Saque solicitado! Aguardando confirmação do banco...")
-        # Salva dados para o comprovante
         context.user_data['comp_nome'] = nome
         context.user_data['comp_cpf'] = cpf
         context.user_data['comp_chave'] = chave
@@ -347,9 +333,18 @@ async def processar_saque(update, context, db_user, session):
         context.user_data['comp_valor'] = valor
         context.user_data['comp_ref'] = ext_ref
     except Exception as e:
-        print(f"Erro Payout: {e}")
-        if hasattr(e, "response") and e.response is not None: print("Detalhes:", e.response.text)
-        await update.message.reply_text("❌ Erro ao processar o saque. Verifique os dados.")
+        erro_detalhe = ""
+        if hasattr(e, "response") and e.response is not None:
+            try:
+                erro_json = e.response.json()
+                erro_detalhe = erro_json.get("message", "") or str(erro_json)
+                causas = erro_json.get("cause", [])
+                if causas:
+                    erro_detalhe += " | " + " ; ".join([c.get("description", "") for c in causas])
+            except:
+                erro_detalhe = e.response.text[:300]
+        print(f"Erro Payout: {e} | Detalhes: {erro_detalhe}")
+        await update.message.reply_text(f"❌ *Erro ao processar o saque:*\n\n`{erro_detalhe[:500]}`", parse_mode='Markdown')
         tx.status = 'failed'; session.commit()
     session.close()
 
@@ -362,55 +357,55 @@ flask_app = Flask(__name__)
 def webhook():
     data = request.json
     print("Webhook recebido:", data)
+    try:
+        # Depósito PIX
+        if data.get("type") == "payment" or data.get("topic") == "payment":
+            payment_id = str(data.get("data", {}).get("id")) or str(data.get("resource"))
+            if payment_id and payment_id != "None":
+                r = requests.get(f"https://api.mercadopago.com/v1/payments/{payment_id}",
+                                 headers={"Authorization": f"Bearer {MERCADOPAGO_ACCESS_TOKEN}"})
+                if r.status_code == 200:
+                    pay = r.json(); status = pay.get("status"); ext_ref = pay.get("external_reference")
+                    if ext_ref and status == "approved":
+                        session = get_session()
+                        tx = session.query(Transaction).filter_by(external_reference=ext_ref).first()
+                        if tx and tx.status != 'completed':
+                            tx.status = 'completed'
+                            user = session.query(User).filter_by(id=tx.user_id).first()
+                            if user:
+                                user.balance += tx.amount; session.commit()
+                                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                                              json={"chat_id": user.telegram_id, "text": f"✅ *Depósito confirmado!*\nValor: R$ {tx.amount:.2f}\nNovo saldo: R$ {user.balance:.2f}", "parse_mode": "Markdown"})
+                        session.close()
 
-    # Depósito PIX
-    if data.get("type") == "payment" or "payment" in data.get("action", ""):
-        payment_id = str(data.get("data", {}).get("id"))
-        if payment_id:
-            r = requests.get(f"https://api.mercadopago.com/v1/payments/{payment_id}",
-                             headers={"Authorization": f"Bearer {MERCADOPAGO_ACCESS_TOKEN}"})
-            if r.status_code == 200:
-                pay = r.json(); status = pay.get("status"); ext_ref = pay.get("external_reference")
-                if ext_ref and status == "approved":
-                    session = get_session()
-                    tx = session.query(Transaction).filter_by(external_reference=ext_ref).first()
-                    if tx and tx.status != 'completed':
+        # Saque
+        if 'transaction' in data.get('type', '') or 'payout' in data.get('action', ''):
+            ext_ref = data.get('data', {}).get('external_reference'); status = data.get('data', {}).get('status')
+            if ext_ref and status:
+                session = get_session()
+                tx = session.query(Transaction).filter_by(external_reference=ext_ref).first()
+                if tx:
+                    user = session.query(User).filter_by(id=tx.user_id).first()
+                    if status in ['approved', 'completed']:
                         tx.status = 'completed'
-                        user = session.query(User).filter_by(id=tx.user_id).first()
+                        if user and user.balance >= tx.amount:
+                            user.balance -= tx.amount
+                        session.commit()
                         if user:
-                            user.balance += tx.amount; session.commit()
+                            data_str = datetime.now().strftime("%d/%m/%Y %H:%M")
+                            buf = gerar_comprovante(tx.nome_titular or "-", tx.cpf_titular or "", tx.pix_chave or "", tx.pix_tipo or "", tx.amount, data_str, "Saque realizado com sucesso", tx.external_reference)
+                            files = {"photo": ("comprovante.png", buf, "image/png")}
+                            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                                          data={"chat_id": user.telegram_id, "caption": "🧾 *Comprovante de transferência*", "parse_mode": "Markdown"},
+                                          files=files)
+                    elif status in ['rejected', 'failed', 'cancelled']:
+                        tx.status = 'failed'; session.commit()
+                        if user:
                             requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                                          json={"chat_id": user.telegram_id, "text": f"✅ *Depósito confirmado!*\nValor: R$ {tx.amount:.2f}\nNovo saldo: R$ {user.balance:.2f}", "parse_mode": "Markdown"})
-                    session.close()
-
-    # Saque
-    if 'transaction' in data.get('type', '') or 'payout' in data.get('action', ''):
-        ext_ref = data.get('data', {}).get('external_reference'); status = data.get('data', {}).get('status')
-        if ext_ref and status:
-            session = get_session()
-            tx = session.query(Transaction).filter_by(external_reference=ext_ref).first()
-            if tx:
-                user = session.query(User).filter_by(id=tx.user_id).first()
-                if status in ['approved', 'completed']:
-                    tx.status = 'completed'
-                    # Desconta saldo
-                    if user and user.balance >= tx.amount:
-                        user.balance -= tx.amount
-                    session.commit()
-                    if user:
-                        # Gera comprovante e envia
-                        data_str = datetime.now().strftime("%d/%m/%Y %H:%M")
-                        buf = gerar_comprovante(tx.nome_titular or "—", tx.cpf_titular or "", tx.pix_chave or "", tx.pix_tipo or "", tx.amount, data_str, "Saque realizado com sucesso", tx.external_reference)
-                        files = {"photo": ("comprovante.png", buf, "image/png")}
-                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                                      data={"chat_id": user.telegram_id, "caption": "🧾 *Comprovante de transferência*", "parse_mode": "Markdown"},
-                                      files=files)
-                elif status in ['rejected', 'failed', 'cancelled']:
-                    tx.status = 'failed'; session.commit()
-                    if user:
-                        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                                      json={"chat_id": user.telegram_id, "text": f"❌ *Falha no Saque*\nValor: R$ {tx.amount:.2f}", "parse_mode": "Markdown"})
-            session.close()
+                                          json={"chat_id": user.telegram_id, "text": f"❌ *Falha no Saque*\nValor: R$ {tx.amount:.2f}", "parse_mode": "Markdown"})
+                session.close()
+    except Exception as e:
+        print(f"Erro no webhook: {e}")
 
     return jsonify({"status": "received"}), 200
 
