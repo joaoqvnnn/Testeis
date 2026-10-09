@@ -3,6 +3,7 @@ import threading
 import asyncio
 import hashlib
 import uuid
+import base64
 from datetime import datetime
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -38,7 +39,7 @@ class Transaction(Base):
     __tablename__ = 'transactions'
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, nullable=False)
-    type = Column(String(20))          # 'deposit' | 'withdraw'
+    type = Column(String(20))
     amount = Column(Float, nullable=False)
     status = Column(String(20), default='pending')
     external_reference = Column(String(100), unique=True)
@@ -75,6 +76,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         teclado.append([InlineKeyboardButton("⚙️ Painel Admin", callback_data="admin_painel")])
     await update.message.reply_text(f"Olá, {user.first_name}! Escolha uma opção:", reply_markup=InlineKeyboardMarkup(teclado))
 
+# --- Handler dos menus principais (com pattern explícito) ---
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query; await query.answer()
     data = query.data; user = query.from_user
@@ -128,6 +130,24 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     session.close()
 
+# --- Handler dos tipos de chave PIX ---
+async def pix_tipo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    tipo = query.data.split("_")[1]
+    context.user_data['pix_tipo'] = tipo
+    context.user_data['acao'] = 'aguardando_chave_pix'
+    await query.edit_message_text(f"Você escolheu {tipo.upper()}. Agora digite a chave PIX:")
+
+# --- Handler de confirmar/cancelar saque ---
+async def confirmar_saque_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query; await query.answer()
+    if query.data == "confirmar_saque":
+        await query.edit_message_text("🔒 Digite sua senha de saque:")
+        context.user_data['acao'] = 'aguardando_senha'
+    else:
+        await query.edit_message_text("❌ Saque cancelado.")
+        context.user_data.clear()
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user; text = update.message.text
     session = get_session(); db_user = session.query(User).filter_by(telegram_id=str(user.id)).first()
@@ -162,7 +182,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: await update.message.reply_text("❌ Valor inválido.")
 
     elif acao == 'aguardando_chave_pix':
-        context.user_data['pix_valor'] = text; context.user_data['acao'] = 'aguardando_cpf_titular'
+        context.user_data['pix_valor'] = text
+        context.user_data['acao'] = 'aguardando_cpf_titular'
         await update.message.reply_text("Digite o CPF do titular:")
 
     elif acao == 'aguardando_cpf_titular':
@@ -202,24 +223,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Use /start para ver o menu.")
     session.close()
 
-async def pix_tipo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    context.user_data['pix_tipo'] = query.data.split("_")[1]; context.user_data['acao'] = 'aguardando_chave_pix'
-    await query.edit_message_text("Digite a chave PIX:")
-
-async def confirmar_saque_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query; await query.answer()
-    if query.data == "confirmar_saque":
-        await query.edit_message_text("🔒 Digite sua senha de saque:")
-        context.user_data['acao'] = 'aguardando_senha'
-    else:
-        await query.edit_message_text("❌ Saque cancelado."); context.user_data.clear()
-
 # ============================================================
 # ================== DEPÓSITO VIA PIX REAL ===================
 # ============================================================
 async def gerar_pix_deposito(update, context, target_user, valor, admin=False):
-    """Gera uma cobrança PIX real no Mercado Pago e envia o QR Code para o chat."""
     ext_ref = f"DEP-{uuid.uuid4().hex[:12]}"
 
     url = "https://api.mercadopago.com/v1/payments"
@@ -250,7 +257,6 @@ async def gerar_pix_deposito(update, context, target_user, valor, admin=False):
         qr_code_base64 = data.get("point_of_interaction", {}).get("transaction_data", {}).get("qr_code_base64")
         payment_id = str(data.get("id"))
 
-        # Salva a transação pendente
         session = get_session()
         tx = Transaction(
             user_id=target_user.id,
@@ -269,17 +275,12 @@ async def gerar_pix_deposito(update, context, target_user, valor, admin=False):
             f"ID Pagamento: `{payment_id}`\n\n"
             f"👉 Pague o QR Code abaixo. O saldo será creditado automaticamente quando o PIX for confirmado."
         )
-
-        # Envia o texto
         await update.message.reply_text(texto, parse_mode='Markdown')
 
-        # Envia o QR Code como imagem
         if qr_code_base64:
-            import base64
             img_bytes = base64.b64decode(qr_code_base64)
             await update.message.reply_photo(photo=img_bytes, caption="📷 QR Code PIX")
 
-        # Envia o código copia e cola
         if qr_code:
             await update.message.reply_text(f"🔗 *PIX Copia e Cola:*\n\n`{qr_code}`", parse_mode='Markdown')
 
@@ -337,7 +338,6 @@ def webhook():
     if data.get("type") == "payment" or "payment" in data.get("action", ""):
         payment_id = str(data.get("data", {}).get("id"))
         if payment_id:
-            # Consulta o pagamento para confirmar status
             r = requests.get(
                 f"https://api.mercadopago.com/v1/payments/{payment_id}",
                 headers={"Authorization": f"Bearer {MERCADOPAGO_ACCESS_TOKEN}"}
@@ -393,10 +393,12 @@ def run_bot():
     asyncio.set_event_loop(loop)
 
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Handlers com patterns específicos para evitar conflito
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(menu_callback))
     application.add_handler(CallbackQueryHandler(pix_tipo_callback, pattern="^pix_"))
     application.add_handler(CallbackQueryHandler(confirmar_saque_callback, pattern="^(confirmar_saque|cancelar_saque)$"))
+    application.add_handler(CallbackQueryHandler(menu_callback, pattern="^(menu_|admin_)"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     async def _start():
