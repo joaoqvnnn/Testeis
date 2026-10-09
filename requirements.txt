@@ -1,0 +1,6 @@
+python-telegram-bot==21.6
+mercadopago==2.3.0
+SQLAlchemy==2.0.36
+python-dotenv==1.0.1
+requests==2.32.3
+Flask==3.1.0
