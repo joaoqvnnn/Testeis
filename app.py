@@ -1,7 +1,6 @@
 import os
 import threading
 import asyncio
-import logging
 import hashlib
 import uuid
 from datetime import datetime
@@ -22,7 +21,7 @@ ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
 MERCADOPAGO_ACCESS_TOKEN = os.getenv("MERCADOPAGO_ACCESS_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-# --- Banco de Dados (SQLite) ---
+# --- Banco de Dados ---
 Base = declarative_base()
 engine = create_engine('sqlite:///database.db', echo=False, connect_args={'check_same_thread': False})
 Session = sessionmaker(bind=engine)
@@ -39,20 +38,24 @@ class Transaction(Base):
     __tablename__ = 'transactions'
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, nullable=False)
-    type = Column(String(20))
+    type = Column(String(20))          # 'deposit' | 'withdraw'
     amount = Column(Float, nullable=False)
     status = Column(String(20), default='pending')
-    external_reference = Column(String(100))
+    external_reference = Column(String(100), unique=True)
+    mp_payment_id = Column(String(50))
     created_at = Column(DateTime, default=datetime.utcnow)
 
 Base.metadata.create_all(engine)
 def get_session(): return Session()
 
-# --- Funções Auxiliares ---
+# --- Auxiliares ---
 def hash_senha(s): return hashlib.sha256(s.encode()).hexdigest()
 def is_admin(uid): return str(uid) == str(ADMIN_TELEGRAM_ID)
 
-# --- Bot do Telegram ---
+# ============================================================
+# ======================= BOT TELEGRAM =======================
+# ============================================================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     session = get_session()
@@ -65,7 +68,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     teclado = [
         [InlineKeyboardButton("💰 Meu Saldo", callback_data="menu_saldo")],
         [InlineKeyboardButton("💸 Sacar PIX", callback_data="menu_sacar")],
-        [InlineKeyboardButton("🔑 Definir Senha de Saque", callback_data="menu_senha")]
+        [InlineKeyboardButton("🔑 Definir Senha de Saque", callback_data="menu_senha")],
+        [InlineKeyboardButton("➕ Depositar via PIX", callback_data="menu_depositar")]
     ]
     if is_admin(user.id):
         teclado.append([InlineKeyboardButton("⚙️ Painel Admin", callback_data="admin_painel")])
@@ -78,36 +82,50 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu_saldo":
         await query.edit_message_text(f"💰 Seu saldo atual é: R$ {db_user.balance:.2f}")
+
+    elif data == "menu_depositar":
+        await query.edit_message_text("Digite o valor que deseja depositar via PIX (ex: 50.00):")
+        context.user_data['acao'] = 'user_aguardando_valor_deposito'
+
     elif data == "menu_sacar":
-        if db_user.balance <= 0: await query.edit_message_text("❌ Saldo insuficiente.")
-        elif not db_user.senha_hash: await query.edit_message_text("⚠️ Defina uma senha de saque primeiro.")
+        if db_user.balance <= 0:
+            await query.edit_message_text("❌ Saldo insuficiente.")
+        elif not db_user.senha_hash:
+            await query.edit_message_text("⚠️ Defina uma senha de saque primeiro.")
         else:
             await query.edit_message_text("Qual o valor do saque? (Ex: 10.50)")
             context.user_data['acao'] = 'aguardando_valor_saque'
+
     elif data == "menu_senha":
         await query.edit_message_text("Digite a nova senha de saque:")
         context.user_data['acao'] = 'definir_senha'
+
     elif data == "admin_painel" and is_admin(user.id):
         teclado_admin = [
-            [InlineKeyboardButton("➕ Depositar Saldo", callback_data="admin_depositar")],
+            [InlineKeyboardButton("➕ Depositar Saldo (PIX real)", callback_data="admin_depositar")],
             [InlineKeyboardButton("👥 Listar Usuários", callback_data="admin_listar_users")],
             [InlineKeyboardButton("📜 Últimas Transações", callback_data="admin_transacoes")],
             [InlineKeyboardButton("🔙 Voltar", callback_data="admin_voltar")]
         ]
         await query.edit_message_text("⚙️ Painel Administrativo:", reply_markup=InlineKeyboardMarkup(teclado_admin))
+
     elif data == "admin_voltar" and is_admin(user.id):
         await query.edit_message_text("Use /start para voltar ao menu principal.")
+
     elif data == "admin_depositar" and is_admin(user.id):
-        await query.edit_message_text("Digite o ID do Telegram do usuário:")
+        await query.edit_message_text("Digite o ID do Telegram do usuário que vai receber o saldo:")
         context.user_data['acao'] = 'admin_aguardando_id_deposito'
+
     elif data == "admin_listar_users" and is_admin(user.id):
         users = session.query(User).all()
         texto = "👥 *Usuários:*\n\n" + "\n".join([f"ID: `{u.telegram_id}` | Saldo: R$ {u.balance:.2f}" for u in users])
         await query.edit_message_text(texto, parse_mode='Markdown')
+
     elif data == "admin_transacoes" and is_admin(user.id):
         txs = session.query(Transaction).order_by(Transaction.created_at.desc()).limit(10).all()
         texto = "📜 *Últimas Transações:*\n\n" + "\n".join([f"ID: {tx.id} | {tx.type} | R$ {tx.amount:.2f} | {tx.status}" for tx in txs])
         await query.edit_message_text(texto, parse_mode='Markdown')
+
     session.close()
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -115,44 +133,73 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session = get_session(); db_user = session.query(User).filter_by(telegram_id=str(user.id)).first()
     acao = context.user_data.get('acao')
 
+    # --- Cliente: definir senha ---
     if acao == 'definir_senha':
         db_user.senha_hash = hash_senha(text); session.commit()
         context.user_data.clear(); await update.message.reply_text("✅ Senha definida!")
+
+    # --- Cliente: depositar via PIX ---
+    elif acao == 'user_aguardando_valor_deposito':
+        try:
+            valor = float(text.replace(',', '.'))
+            if valor <= 0: raise ValueError
+            await gerar_pix_deposito(update, context, db_user, valor)
+        except:
+            await update.message.reply_text("❌ Valor inválido.")
+        context.user_data.clear()
+
+    # --- Cliente: saque ---
     elif acao == 'aguardando_valor_saque':
         try:
             valor = float(text.replace(',', '.'))
             if valor <= 0 or valor > db_user.balance: raise ValueError
             context.user_data['valor_saque'] = valor; context.user_data['acao'] = 'aguardando_tipo_pix'
-            teclado = [[InlineKeyboardButton("CPF", callback_data="pix_CPF"), InlineKeyboardButton("E-mail", callback_data="pix_email")]]
+            teclado = [
+                [InlineKeyboardButton("CPF", callback_data="pix_CPF"), InlineKeyboardButton("E-mail", callback_data="pix_email")],
+                [InlineKeyboardButton("Telefone", callback_data="pix_phone"), InlineKeyboardButton("Aleatória", callback_data="pix_random")]
+            ]
             await update.message.reply_text("Escolha o tipo de chave PIX:", reply_markup=InlineKeyboardMarkup(teclado))
         except: await update.message.reply_text("❌ Valor inválido.")
+
     elif acao == 'aguardando_chave_pix':
         context.user_data['pix_valor'] = text; context.user_data['acao'] = 'aguardando_cpf_titular'
         await update.message.reply_text("Digite o CPF do titular:")
+
     elif acao == 'aguardando_cpf_titular':
         context.user_data['cpf_titular'] = text
         resumo = f"📋 *Confirme:*\nValor: R$ {context.user_data['valor_saque']:.2f}\nChave: {context.user_data['pix_tipo']} - {context.user_data['pix_valor']}\nCPF: {text}"
         teclado = [[InlineKeyboardButton("✅ Confirmar", callback_data="confirmar_saque"), InlineKeyboardButton("❌ Cancelar", callback_data="cancelar_saque")]]
         await update.message.reply_text(resumo, reply_markup=InlineKeyboardMarkup(teclado), parse_mode='Markdown')
+
     elif acao == 'aguardando_senha':
         if db_user.senha_hash and hash_senha(text) == db_user.senha_hash:
             await update.message.reply_text("🔄 Processando saque...")
             await processar_saque(update, context, db_user, session)
-        else: await update.message.reply_text("❌ Senha incorreta.")
+        else:
+            await update.message.reply_text("❌ Senha incorreta.")
+
+    # --- Admin: depósito via PIX ---
     elif acao == 'admin_aguardando_id_deposito' and is_admin(user.id):
-        context.user_data['admin_target_id'] = text; context.user_data['acao'] = 'admin_aguardando_valor_deposito'
-        await update.message.reply_text("Digite o valor do depósito:")
+        context.user_data['admin_target_id'] = text
+        context.user_data['acao'] = 'admin_aguardando_valor_deposito'
+        await update.message.reply_text("Digite o valor do depósito PIX (ex: 50.00):")
+
     elif acao == 'admin_aguardando_valor_deposito' and is_admin(user.id):
         try:
-            valor = float(text.replace(',', '.')); target_id = context.user_data.get('admin_target_id')
+            valor = float(text.replace(',', '.'))
+            if valor <= 0: raise ValueError
+            target_id = context.user_data.get('admin_target_id')
             target_user = session.query(User).filter_by(telegram_id=target_id).first()
-            if target_user:
-                target_user.balance += valor; session.add(Transaction(user_id=target_user.id, type='deposit', amount=valor, status='completed')); session.commit()
-                await update.message.reply_text(f"✅ Depósito de R$ {valor:.2f} realizado.")
-            else: await update.message.reply_text("❌ Usuário não encontrado.")
-        except: await update.message.reply_text("❌ Valor inválido.")
+            if not target_user:
+                await update.message.reply_text("❌ Usuário não encontrado.")
+            else:
+                await gerar_pix_deposito(update, context, target_user, valor, admin=True)
+        except:
+            await update.message.reply_text("❌ Valor inválido.")
         context.user_data.clear()
-    else: await update.message.reply_text("Use /start para ver o menu.")
+
+    else:
+        await update.message.reply_text("Use /start para ver o menu.")
     session.close()
 
 async def pix_tipo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -168,11 +215,88 @@ async def confirmar_saque_callback(update: Update, context: ContextTypes.DEFAULT
     else:
         await query.edit_message_text("❌ Saque cancelado."); context.user_data.clear()
 
+# ============================================================
+# ================== DEPÓSITO VIA PIX REAL ===================
+# ============================================================
+async def gerar_pix_deposito(update, context, target_user, valor, admin=False):
+    """Gera uma cobrança PIX real no Mercado Pago e envia o QR Code para o chat."""
+    ext_ref = f"DEP-{uuid.uuid4().hex[:12]}"
+
+    url = "https://api.mercadopago.com/v1/payments"
+    headers = {
+        "Authorization": f"Bearer {MERCADOPAGO_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+        "X-Idempotency-Key": ext_ref
+    }
+
+    payload = {
+        "transaction_amount": float(valor),
+        "description": f"Depósito no bot - User {target_user.telegram_id}",
+        "payment_method_id": "pix",
+        "external_reference": ext_ref,
+        "notification_url": WEBHOOK_URL,
+        "payer": {
+            "email": f"user{target_user.telegram_id}@teste.com",
+            "first_name": target_user.username or "Cliente"
+        }
+    }
+
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+
+        qr_code = data.get("point_of_interaction", {}).get("transaction_data", {}).get("qr_code")
+        qr_code_base64 = data.get("point_of_interaction", {}).get("transaction_data", {}).get("qr_code_base64")
+        payment_id = str(data.get("id"))
+
+        # Salva a transação pendente
+        session = get_session()
+        tx = Transaction(
+            user_id=target_user.id,
+            type='deposit',
+            amount=valor,
+            status='pending',
+            external_reference=ext_ref,
+            mp_payment_id=payment_id
+        )
+        session.add(tx); session.commit(); session.close()
+
+        texto = (
+            f"💳 *Depósito PIX gerado!*\n\n"
+            f"Usuário: `{target_user.telegram_id}`\n"
+            f"Valor: *R$ {valor:.2f}*\n"
+            f"ID Pagamento: `{payment_id}`\n\n"
+            f"👉 Pague o QR Code abaixo. O saldo será creditado automaticamente quando o PIX for confirmado."
+        )
+
+        # Envia o texto
+        await update.message.reply_text(texto, parse_mode='Markdown')
+
+        # Envia o QR Code como imagem
+        if qr_code_base64:
+            import base64
+            img_bytes = base64.b64decode(qr_code_base64)
+            await update.message.reply_photo(photo=img_bytes, caption="📷 QR Code PIX")
+
+        # Envia o código copia e cola
+        if qr_code:
+            await update.message.reply_text(f"🔗 *PIX Copia e Cola:*\n\n`{qr_code}`", parse_mode='Markdown')
+
+    except Exception as e:
+        print(f"Erro ao gerar PIX: {e}")
+        if hasattr(e, "response") and e.response is not None:
+            print("Detalhes:", e.response.text)
+        await update.message.reply_text("❌ Erro ao gerar PIX. Verifique as credenciais do Mercado Pago.")
+
+# ============================================================
+# ======================= SAQUE PIX ==========================
+# ============================================================
 async def processar_saque(update, context, db_user, session):
     valor = context.user_data.get('valor_saque'); tipo = context.user_data.get('pix_tipo')
     chave = context.user_data.get('pix_valor'); cpf = context.user_data.get('cpf_titular')
-    ext_ref = str(uuid.uuid4())[:20]
-    
+    ext_ref = f"SAQ-{uuid.uuid4().hex[:12]}"
+
     tx = Transaction(user_id=db_user.id, type='withdraw', amount=valor, status='pending', external_reference=ext_ref)
     session.add(tx); session.commit()
 
@@ -193,17 +317,52 @@ async def processar_saque(update, context, db_user, session):
         await update.message.reply_text("⏳ Saque solicitado! Aguardando confirmação do banco...")
     except Exception as e:
         print(f"Erro Payout: {e}")
+        if hasattr(e, "response") and e.response is not None:
+            print("Detalhes:", e.response.text)
         await update.message.reply_text("❌ Erro ao processar o saque. Verifique os dados.")
         tx.status = 'failed'; session.commit()
     context.user_data.clear(); session.close()
 
-# --- Flask App (Webhook) ---
+# ============================================================
+# ======================= FLASK WEBHOOK ======================
+# ============================================================
 flask_app = Flask(__name__)
 
 @flask_app.route('/webhook', methods=['POST'])
 def webhook():
     data = request.json
     print("Webhook recebido:", data)
+
+    # Webhook de pagamento PIX (depósito)
+    if data.get("type") == "payment" or "payment" in data.get("action", ""):
+        payment_id = str(data.get("data", {}).get("id"))
+        if payment_id:
+            # Consulta o pagamento para confirmar status
+            r = requests.get(
+                f"https://api.mercadopago.com/v1/payments/{payment_id}",
+                headers={"Authorization": f"Bearer {MERCADOPAGO_ACCESS_TOKEN}"}
+            )
+            if r.status_code == 200:
+                pay = r.json()
+                status = pay.get("status")
+                ext_ref = pay.get("external_reference")
+                if ext_ref and status == "approved":
+                    session = get_session()
+                    tx = session.query(Transaction).filter_by(external_reference=ext_ref).first()
+                    if tx and tx.status != 'completed':
+                        tx.status = 'completed'
+                        user = session.query(User).filter_by(id=tx.user_id).first()
+                        if user:
+                            user.balance += tx.amount
+                            session.commit()
+                            msg = f"✅ *Depósito confirmado!*\nValor: R$ {tx.amount:.2f}\nNovo saldo: R$ {user.balance:.2f}"
+                            requests.post(
+                                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                                json={"chat_id": user.telegram_id, "text": msg, "parse_mode": "Markdown"}
+                            )
+                    session.close()
+
+    # Webhook de payout (saque)
     if 'transaction' in data.get('type', '') or 'payout' in data.get('action', ''):
         ext_ref = data.get('data', {}).get('external_reference')
         status = data.get('data', {}).get('status')
@@ -215,17 +374,20 @@ def webhook():
                 if status in ['approved', 'completed']:
                     tx.status = 'completed'; session.commit()
                     if user:
-                        msg = f"✅ *Saque Realizado!*\nValor: R$ {tx.amount:.2f}\nStatus: Concluído"
+                        msg = f"✅ *Saque Realizado!*\nValor: R$ {tx.amount:.2f}"
                         requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": user.telegram_id, "text": msg, "parse_mode": "Markdown"})
                 elif status in ['rejected', 'failed', 'cancelled']:
                     tx.status = 'failed'; session.commit()
                     if user:
-                        msg = f"❌ *Falha no Saque*\nValor: R$ {tx.amount:.2f}\nMotivo: Rejeitado pelo banco."
+                        msg = f"❌ *Falha no Saque*\nValor: R$ {tx.amount:.2f}"
                         requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": user.telegram_id, "text": msg, "parse_mode": "Markdown"})
             session.close()
+
     return jsonify({"status": "received"}), 200
 
-# --- Inicialização do Bot (versão assíncrona sem dependência de main thread) ---
+# ============================================================
+# ======================= INICIALIZAÇÃO ======================
+# ============================================================
 def run_bot():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -247,7 +409,6 @@ def run_bot():
 
     loop.run_until_complete(_start())
 
-# Inicia o bot automaticamente quando o Gunicorn importar o módulo
 bot_thread = threading.Thread(target=run_bot, daemon=True)
 bot_thread.start()
 
